@@ -1,0 +1,329 @@
+# Copied from Vulnetix/vdb-site api/internal/handler/assets/aws-bootstrap.yaml
+# at 31eb7ac by scripts/sync-template.sh. Do not edit here: change it there and re-sync,
+# so this module and the console deploy the same stack.
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >-
+  Vulnetix security logging — bootstrap. Creates the CloudTrail log bucket and
+  the cross-account role Vulnetix assumes to read this account. Deployed with
+  the operator's IAM Identity Center credentials, because the role it creates is
+  the thing everything afterwards depends on.
+
+Parameters:
+  ExternalId:
+    Type: String
+    Description: >-
+      The Vulnetix organisation uuid. Required in sts:ExternalId on every
+      assume, so a third party who learns the role ARN still cannot use it.
+    AllowedPattern: '^[A-Za-z0-9-]{8,64}$'
+
+  VulnetixAccountId:
+    Type: String
+    Default: '061882422009'
+    Description: The AWS account whose Vulnetix service assumes the role below.
+    AllowedPattern: '^[0-9]{12}$'
+
+Resources:
+  # CloudTrail's delivery target. Named after the account so a Vulnetix bucket
+  # is recognisable in a console listing and cannot collide globally.
+  LogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'vulnetix-cloudtrail-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+  # The two statements CloudTrail requires, both pinned to this account's own
+  # Vulnetix trail via aws:SourceArn — without that condition any trail in any
+  # account could write here.
+  LogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LogBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt LogBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/vulnetix-management-events'
+
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${LogBucket.Arn}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/vulnetix-management-events'
+
+  # The role Vulnetix assumes for everything after this stack: deploying the
+  # pipeline stack, uploading the probe bundle, and verifying log access.
+  #
+  # Its permissions are the union of what those operations need. They are
+  # deliberately not read-only — CloudFormation runs as this role when it
+  # creates the pipeline stack, so the role must be able to create exactly the
+  # resources that stack declares, and nothing else.
+  AuditorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: VulnetixSecurityAuditor
+      Description: Lets Vulnetix deploy and read its security logging pipeline in this account.
+      MaxSessionDuration: 43200
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${VulnetixAccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref ExternalId
+      Policies:
+        - PolicyName: VulnetixSecurityAuditPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # CloudFormation, scoped to the two stacks Vulnetix owns. The
+              # account-wide read actions have no resource form.
+              - Sid: CloudFormationStacks
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:GetTemplateSummary
+                  # Drift detection is how the Vulnetix console answers "has
+                  # anything in this account been changed underneath us" without
+                  # asking the customer to look.
+                  - cloudformation:DetectStackDrift
+                  - cloudformation:DetectStackResourceDrift
+                  - cloudformation:DescribeStackDriftDetectionStatus
+                  - cloudformation:DescribeStackResourceDrifts
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:*:${AWS::AccountId}:stack/vulnetix-security-bootstrap/*'
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:*:${AWS::AccountId}:stack/vulnetix-security-pipeline/*'
+
+              - Sid: CloudFormationValidate
+                Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+                Resource: '*'
+
+              - Sid: CloudTrail
+                Effect: Allow
+                Action:
+                  - cloudtrail:CreateTrail
+                  - cloudtrail:DeleteTrail
+                  - cloudtrail:DescribeTrails
+                  - cloudtrail:GetTrail
+                  - cloudtrail:GetTrailStatus
+                  - cloudtrail:StartLogging
+                  - cloudtrail:StopLogging
+                  - cloudtrail:UpdateTrail
+                  - cloudtrail:AddTags
+                  - cloudtrail:ListTags
+                  - cloudtrail:RemoveTags
+                  - cloudtrail:PutEventSelectors
+                  - cloudtrail:GetEventSelectors
+                Resource: '*'
+
+              # The log bucket, including reading an object back — that read is
+              # the whole point of the verification probe.
+              #
+              # The tag-write actions here and below are not optional extras:
+              # the stacks carry a ManagedBy tag that CloudFormation propagates
+              # to every resource it creates, so a resource whose tag-write
+              # action is missing fails its own create outright.
+              - Sid: LogBucket
+                Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:DeleteBucket
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                  - s3:GetBucketPolicy
+                  - s3:PutBucketPolicy
+                  - s3:DeleteBucketPolicy
+                  - s3:GetBucketPublicAccessBlock
+                  - s3:PutBucketPublicAccessBlock
+                  - s3:GetEncryptionConfiguration
+                  - s3:PutEncryptionConfiguration
+                  - s3:GetBucketOwnershipControls
+                  - s3:PutBucketOwnershipControls
+                  - s3:GetBucketTagging
+                  - s3:PutBucketTagging
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::vulnetix-cloudtrail-${AWS::AccountId}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::vulnetix-cloudtrail-${AWS::AccountId}/*'
+
+              - Sid: SecurityHub
+                Effect: Allow
+                Action:
+                  - securityhub:DescribeHub
+                  - securityhub:EnableSecurityHub
+                  - securityhub:GetFindings
+                  - securityhub:BatchGetFindings
+                  - securityhub:BatchImportFindings
+                Resource: '*'
+
+              - Sid: EventBridge
+                Effect: Allow
+                Action:
+                  - events:PutRule
+                  - events:DeleteRule
+                  - events:DescribeRule
+                  - events:PutTargets
+                  - events:RemoveTargets
+                  - events:ListTargetsByRule
+                  - events:ListTagsForResource
+                  - events:TagResource
+                  - events:UntagResource
+                Resource: !Sub 'arn:${AWS::Partition}:events:*:${AWS::AccountId}:rule/vulnetix-cloudtrail-to-reporter'
+
+              - Sid: ReporterQueue
+                Effect: Allow
+                Action:
+                  - sqs:CreateQueue
+                  - sqs:DeleteQueue
+                  - sqs:GetQueueUrl
+                  - sqs:GetQueueAttributes
+                  - sqs:SetQueueAttributes
+                  - sqs:ListQueueTags
+                  - sqs:TagQueue
+                  - sqs:UntagQueue
+                Resource: !Sub 'arn:${AWS::Partition}:sqs:*:${AWS::AccountId}:vulnetix-security-reporter'
+
+              # Lambda has no meaningful resource-level control for the create
+              # path, so this is action-scoped rather than resource-scoped.
+              #
+              # InvokeFunction is here so Vulnetix support can run the probe on
+              # demand. On a quiet account there may be no qualifying API
+              # activity for hours, and "wait and see" is not a diagnosis. The
+              # probe only reads, so an invocation cannot change anything.
+              - Sid: ReporterFunction
+                Effect: Allow
+                Action:
+                  - lambda:CreateFunction
+                  - lambda:DeleteFunction
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:InvokeFunction
+                  - lambda:ListTags
+                  - lambda:TagResource
+                  - lambda:UntagResource
+                  - lambda:CreateEventSourceMapping
+                  - lambda:DeleteEventSourceMapping
+                  - lambda:GetEventSourceMapping
+                  - lambda:UpdateEventSourceMapping
+                  - lambda:ListEventSourceMappings
+                Resource: '*'
+
+              - Sid: ReporterExecutionRole
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:PassRole
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:ListRoleTags
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/vulnetix-reporter-execution'
+
+              # Enough to update and remove this role itself during teardown.
+              - Sid: AuditorRoleSelf
+                Effect: Allow
+                Action:
+                  - iam:GetRole
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/VulnetixSecurityAuditor'
+
+              - Sid: VulnetixSecrets
+                Effect: Allow
+                Action:
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:DeleteSecret
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:UpdateSecret
+                  - secretsmanager:TagResource
+                  - secretsmanager:UntagResource
+                Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:*:${AWS::AccountId}:secret:vulnetix/*'
+
+              # The probe's log group: created by the pipeline stack, and read
+              # by the verification endpoint to confirm the probe actually ran.
+              - Sid: ReporterLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:DeleteLogGroup
+                  - logs:PutRetentionPolicy
+                  - logs:DeleteRetentionPolicy
+                  - logs:TagResource
+                  - logs:UntagResource
+                  - logs:ListTagsForResource
+                  - logs:DescribeLogStreams
+                  - logs:FilterLogEvents
+                  - logs:GetLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:/aws/lambda/vulnetix-security-reporter*'
+
+              - Sid: LogsDescribe
+                Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: '*'
+
+              - Sid: CallerIdentity
+                Effect: Allow
+                Action: sts:GetCallerIdentity
+                Resource: '*'
+
+Outputs:
+  LogBucketName:
+    Description: The bucket CloudTrail delivers into and the probe bundle is staged in.
+    Value: !Ref LogBucket
+
+  AuditorRoleArn:
+    Description: The role Vulnetix assumes to read this account.
+    Value: !GetAtt AuditorRole.Arn
