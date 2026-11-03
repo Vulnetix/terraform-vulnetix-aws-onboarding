@@ -26,6 +26,14 @@ resource "aws_cloudformation_stack" "bootstrap" {
 
   tags = local.tags
 
+  # on_failure only applies at create time and the CloudFormation API never
+  # returns it, so after importing a stack the console already deployed it reads
+  # as null and Terraform plans to replace the stack: deleting the auditor role and
+  # the log bucket. Ignore it so an import is an in-place adoption.
+  lifecycle {
+    ignore_changes = [on_failure]
+  }
+
   timeouts {
     create = "${var.timeout_minutes}m"
     update = "${var.timeout_minutes}m"
